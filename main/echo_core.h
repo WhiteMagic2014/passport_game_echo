@@ -7,8 +7,8 @@
  *     逐位一致，保证楼层生成、彩蛋触发等随机分布与主机版可复现对齐。
  *   - 数值用 double，与 JS number 一致（0.3 / 1.1 / 2.3 等小数不丢精度）。
  *
- * 本文件不依赖任何 ESP-IDF / BSP 头文件，仅依赖 stdint / stdbool，
- * 可在主机上用 gcc/clang 编译运行测试（tests/test_core.c）。
+ * 本文件不依赖任何 ESP-IDF / BSP 头文件，仅依赖 stdint / stdbool / math，
+ * 可在主机上用 gcc/clang 编译运行测试。
  */
 #pragma once
 
@@ -25,9 +25,10 @@ extern "C" {
  * ========================================================================== */
 #define CFG_WEAR_MAX          100.0
 #define CFG_SANITY_MAX        100.0
-#define CFG_FOOD_MAX          100.0
-#define CFG_DANGER_MAX        100.0
-#define CFG_DANGER_HUNT       50.0
+#define CFG_FOOD_MAX          60.0    /* 携带上限（背包容量，不可无限囤积） */
+#define CFG_FOOD_START        40.0    /* 初始携带 */
+#define CFG_FOOD_CAP          60.0    /* 拾取食物的上限（与 FOOD_MAX 同义） */
+#define CFG_DANGER_MAX        100.0   /* 危险读数上限（由怪物距离推导，不再手动累加） */
 
 #define CFG_WEAR_DOWN         2.3
 #define CFG_WEAR_UP           1.0
@@ -38,11 +39,14 @@ extern "C" {
 #define CFG_FOOD_DOOR         2.5
 #define CFG_FOOD_LISTEN       1.0
 
-#define CFG_DANGER_MOVE       2.0
-#define CFG_DANGER_ECHO       4.0
-#define CFG_DANGER_DOOR       6.0
-#define CFG_DANGER_LISTEN     12.0
-#define CFG_DANGER_SILENT     6.0
+/* 怪物 / 危险 */
+#define CFG_MONSTER_COUNT         1       /* 同局怪物数量 */
+#define CFG_MONSTER_SPAWN_MIN     12      /* 出生楼层下限（不会一开局就贴脸） */
+#define CFG_MONSTER_SPAWN_MAX     95      /* 出生楼层上限 */
+#define CFG_HOMING_MIN            1       /* 被标记后，每回合朝信标移动的最小层数 */
+#define CFG_HOMING_MAX            3       /* 最大层数（速度随机 1~3，HTML 推荐甜点） */
+#define CFG_WANDER_STEP           0.45    /* 游荡时移动（随机 ±1）的概率，其余不动 */
+#define CFG_DANGER_RADIUS         20      /* 危险读数归零的距离（层）；越近危险越高 */
 
 #define CFG_SANITY_FED        0.3
 #define CFG_SANITY_HUNGRY     1.1
@@ -72,9 +76,12 @@ extern "C" {
 #define CFG_DOOR_MS           2600.0
 #define CFG_PANEL_LONG_MS     450
 
+/* 修理：每次修复按几何递减（保底 12 点磨损 = 12% 耐久度）。
+ *   第 1..n 次 = 45 × 0.72^(n-1)：45 → 32.4 → 23.3 → 16.8 → 12.1 → 到底 12。
+ *   触底后固定回 12%，并在文案追加「再修也只能这样了」。 */
 #define CFG_REPAIR_BASE       45.0
-#define CFG_REPAIR_DECAY      0.3
-#define CFG_REPAIR_MIN        0.3
+#define CFG_REPAIR_DECAY      0.72
+#define CFG_REPAIR_FLOOR      12.0
 
 #define CFG_EGG_CHANCE        0.08
 
@@ -90,7 +97,10 @@ extern "C" {
 #define CFG_TRICK_DEPTH_AHEAD 6
 
 #define FRAGMENT_DEPTH_COUNT  6
+/* 碎片层固定基准：仅作旧存档兜底，实际使用 st.fragment_depths（每局纯随机）。 */
 #define FRAGMENT_DEPTHS       { 5, 12, 20, 30, 42, 55 }
+#define FRAGMENT_MIN_DEPTH    10   /* 碎片层随机区间（含） */
+#define FRAGMENT_MAX_DEPTH    100  /* 碎片层随机区间（含） */
 
 /* 状态结构规模上限 */
 #define ECHO_MAX_EVENTS       16     /* 单回合事件槽 */
@@ -99,12 +109,13 @@ extern "C" {
 #define ECHO_FLOOR_OFFSET     128    /* depth + OFFSET = 数组下标 */
 #define ECHO_FLOOR_SLOTS      512    /* 覆盖 depth ∈ [-128, 383] */
 #define ECHO_MAX_PANEL_ITEMS  8
+#define ECHO_MAX_MONSTERS     4      /* 同局怪物数量上限（当前 CFG_MONSTER_COUNT=1） */
 
 /* ==========================================================================
  * 枚举
  * ========================================================================== */
 /* 楼层类型。已移除 FT_STAIRS：本作只能靠电梯上下，不设楼梯。
- * 注意：枚举值变更会导致旧存档的楼层类型错位，故 ECHO_SAVE_VERSION 已升至 2。 */
+ * 注意：枚举值变更会导致旧存档的楼层类型错位，故 ECHO_SAVE_VERSION 已升至 3。 */
 typedef enum {
     FT_EMPTY = 0, FT_CLUTTER, FT_POWER, FT_MEMORY, FT_ANOMALY
 } floor_type_t;
@@ -148,7 +159,7 @@ typedef enum {
 typedef struct {
     uint8_t type;    /* floor_type_t */
     uint8_t flags;   /* bit0 hope, bit1 loot, bit2 tool, bit3 unknown_food,
-                        bit4 fragment, bit5 seen */
+                        bit4 fragment, bit5 seen, bit6 generated, bit7 fragment_taken */
 } Floor;
 
 enum {
@@ -158,7 +169,8 @@ enum {
     FLOOR_F_UNKNOWN_FOOD = 1 << 3,
     FLOOR_F_FRAGMENT = 1 << 4,
     FLOOR_F_SEEN = 1 << 5,
-    FLOOR_F_GENERATED = 1 << 6
+    FLOOR_F_GENERATED = 1 << 6,
+    FLOOR_F_FRAGMENT_TAKEN = 1 << 7   /* 碎片是否已被取走（用于聆听线索消失） */
 };
 
 /* 彩蛋结局（静态表，按 depth 查询） */
@@ -198,10 +210,15 @@ typedef struct {
     int enc, doors, echoes, turn;
     bool ate_unknown, pending_unknown;
 
-    /* 它（恐惧实体） */
-    int fear_pos;        /* 初始 -25 */
-    int fear_mode;       /* 0=wander 1=hunt */
-    bool fear_here;
+    /* 怪物（「它」）：默认 1 只，开局刷新在随机楼层 */
+    int monsters[ECHO_MAX_MONSTERS];
+    int monster_count;
+    bool marked;          /* 是否被呼喊标记过信标 */
+    int mark_floor;       /* 信标所在层（= 某次呼喊时的玩家层） */
+    bool fear_here;       /* 最近怪物是否就在此层 */
+
+    /* 本局碎片层（每局纯随机，升序） */
+    int fragment_depths[FRAGMENT_DEPTH_COUNT];
 
     int phase;           /* phase_t */
     int panel_sel;
@@ -217,6 +234,7 @@ typedef struct {
     /* 开门演出 */
     double door_t;
     DoorResult door_result;
+    bool door_truth;     /* 本次开门触发了真结局（tick 收尾时转入 OVER） */
 
     /* 恐怖手法回合冷却 */
     int trick_silent, trick_cut, trick_ahead;
@@ -274,6 +292,11 @@ double echo_lie_chance(const EchoState *st);
 double echo_ghost_weight(const EchoState *st, int depth);
 uint32_t echo_hash32(uint32_t a, uint32_t b);
 
+/* 怪物查询（供主循环触发脚步音效等集成使用） */
+int echo_nearest_pos(const EchoState *st);
+int echo_nearest_dist(const EchoState *st);
+bool echo_monster_here(const EchoState *st);
+
 /* 彩蛋查询：返回指向静态 EggDef 的指针，无则 NULL。 */
 const EggDef *echo_egg_at(int depth);
 
@@ -282,8 +305,9 @@ const EggDef *echo_egg_at(int depth);
  * 仅用于「继续上一局」，与 LastRun（跨局足迹）是两套不同的存档。
  * ========================================================================== */
 #define ECHO_SAVE_MAGIC    0x4543484Fu   /* "ECHO" */
-/* v2：移除楼梯层（FT_STAIRS）并调整楼层类型枚举值，v1 存档已不兼容，一律拒绝。 */
-#define ECHO_SAVE_VERSION  2
+/* v3：怪物模型重构（fear_pos/fear_mode → monsters[] + 信标），新增 fragment_depths /
+ *     door_truth / mark 字段，Floor 新增 fragment_taken 位。v2 及以下存档一律拒绝。 */
+#define ECHO_SAVE_VERSION  3
 
 typedef struct {
     uint32_t magic;

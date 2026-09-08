@@ -324,11 +324,14 @@ static void handle_input(uint8_t btn, uint8_t ev) {
         if (btn == BTN_OK && ev == BTN_PRESS) end_to_menu();
         return;
     }
-    int fp = s_st.fear_pos;
+    int fp = echo_nearest_pos(&s_st);
     echo_input(&s_st, btn, ev);
     /* 回合制：它只在动作后走一步，这一步远近决定脚步音量 */
-    if (s_st.fear_pos != fp && s_st.ended == -1) {
-        post_sfx(SFX_FOOTSTEP, s_st.fear_pos - s_st.depth);
+    if (s_st.ended == -1) {
+        int np = echo_nearest_pos(&s_st);
+        if (np != fp) {
+            post_sfx(SFX_FOOTSTEP, np - s_st.depth);
+        }
     }
     /* 续局存档：回合推进后保存（面板光标移动等 UI 操作不算回合） */
     if (s_st.ended == -1 && s_st.turn != s_last_turn) {

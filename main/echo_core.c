@@ -5,6 +5,8 @@
 #include "echo_core.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
 /* ==========================================================================
  * 伪随机：uint32 全程运算，与 JS Math.imul / ToInt32 逐位一致
@@ -62,17 +64,49 @@ const EggDef *echo_egg_at(int depth) {
     return NULL;
 }
 
-static const char *fragment_text(int depth) {
-    switch (depth) {
-        case 5:  return "一张住户留言：「最近井道里总有回声，物业说是风。」";
-        case 12: return "失踪报告：「最后监控拍到她进了电梯。电梯没停过。」";
-        case 20: return "维修记录，字迹发抖：「钢缆换过七次。它不让我们修。」";
-        case 30: return "一张纸，只写了一行：「第 47 个。」";
-        case 42: return "录音笔还有电。按下播放——是你自己刚才呼喊的那三声。";
-        case 55: return "一张照片。电梯里的人抬头看着镜头。是你，但衣服不是你的。";
-        default: return "又一张纸，什么都没写。";
-    }
+/* 六张碎片：同一件事的六个侧面，沿「第三声」这条暗线推进。
+ * 按「第几片」(0..5) 取文案：碎片层每局随机，但叙事顺序必须固定——
+ * 玩家总是先捡到第一片（风/井/第三声），最后捡到第六片（照片里的人是你）。 */
+static const char *fragment_text(int idx) {
+    static const char *T[6] = {
+        "一张住户留言，字迹工整：「最近井道里总有回声，物业说是风。可风不会数数：第一声是风，第二声是井，第三声会比你晚一点回来。别让第三声听见你的名字。」",
+        "一张寻人启事，边角被撕过：「她最后出现在一层电梯。监控拍到她对着门喊了三声。门开了，她笑了，像听见有人在叫她的名字。电梯没停过。」",
+        "维修记录，字迹发抖：「钢缆换过七次。每换一次，井道就比图纸深一层。第七次工单的签名栏是空的——可那笔迹我认得，是我的。」",
+        "一张纸，只写了一行：「第 47 个。他已经数到第三声了。别叫他的名字——叫了，他就会回答。」",
+        "录音笔还有电。按下播放：三声呼喊。第三声之后还有第四声，那个声音在数数，一直数到六。你还没有开口。",
+        "一张照片。电梯里的人抬头看着镜头。是你，但衣服不是你的——那是十二层寻人启事上，她失踪那天穿的。"
+    };
+    if (idx < 0 || idx > 5) return "又一张纸，什么都没写。";
+    return T[idx];
 }
+
+/* 聆听对「怪物」的感知：模糊、不给方向/精确层数。
+ * 理智越低越失真：轻度误判一档（远近混淆），重度直接变成幻觉（无信息量）。 */
+static const char *LISTEN_TIERS[] = {
+    "井道深处很安静。安静得不真实。",
+    "远处有动静。你听不出多远，也听不出在哪。",
+    "很近了。近得让你不想开门。",
+    "近得不正常。它就在这一带。"
+};
+static const char *LISTEN_HALLUC[] = {
+    "你听见了什么。可又好像什么都没有。",
+    "回声在你耳朵里打转，分不清远近。",
+    "有什么在听你。这一点你很确定。"
+};
+
+/* 碎片层每局随机，需要给玩家一条能定位的线索，否则只能逐层盲开。
+ * 线索只分两档、且不说上下。写法上统一落在「回声」上，不去写听见纸的响动——
+ * 纸不是声源，它是吸声的东西：门缝被薄薄地垫住，回声到那里就哑了、钝了、软了。 */
+static const char *FRAG_HINT_HERE[] = {
+    "回声撞在门缝上就散了。底下垫着东西，很薄，把声音吸了进去。",
+    "你数着回声。第三声没回来——门缝底下压着什么，很薄，把它接住了。",
+    "门缝那儿是哑的。回声走到那里就没了，像被一张纸捂住。"
+};
+static const char *FRAG_HINT_NEAR[] = {
+    "井道里有一层是哑的。回声经过时不响——那层的门缝，被垫住了。",
+    "回声从隔壁那层回来时是钝的。有什么薄薄的东西，压在它的门缝上。",
+    "隔壁那层的安静不一样。回声到那儿会软一下，像碰到了纸。"
+};
 
 /* ==========================================================================
  * 消息辅助
@@ -84,9 +118,12 @@ static void set_msg(EchoState *st, const char *s) {
 /* ==========================================================================
  * 楼层生成
  * ========================================================================== */
-static bool is_frag_depth(int depth) {
+static bool is_frag_depth(const EchoState *st, int depth) {
     for (int i = 0; i < FRAGMENT_DEPTH_COUNT; i++) {
-        if (FRAGMENT_DEPTHS_TABLE[i] == depth) return true;
+        if (st->fragment_depths[i] == depth) return true;
+    }
+    for (int i = 0; i < FRAGMENT_DEPTH_COUNT; i++) {
+        if (FRAGMENT_DEPTHS_TABLE[i] == depth) return true;  /* 旧存档兜底 */
     }
     return false;
 }
@@ -117,10 +154,11 @@ static Floor *floor_at(EchoState *st, int depth) {
     else if (r < 0.87) type = FT_MEMORY;
     else type = FT_ANOMALY;
 
-    bool frag = is_frag_depth(depth);
+    bool frag = is_frag_depth(st, depth);
     f->type = (uint8_t)(frag ? FT_MEMORY : type);
     f->flags = 0;
     floor_set(f, FLOOR_F_FRAGMENT, frag);
+    floor_set(f, FLOOR_F_FRAGMENT_TAKEN, false);
     /* 碎片层清空一切会顶掉碎片的掉落 */
     floor_set(f, FLOOR_F_HOPE,         !frag && (r3 < 0.20));
     floor_set(f, FLOOR_F_LOOT,         !frag && (r3 >= 0.20 && r3 < 0.60));
@@ -135,13 +173,150 @@ const Floor *echo_floor_at(EchoState *st, int depth) {
 }
 
 /* ==========================================================================
+ * 怪物（「它」）—— 默认 1 只，开局刷新在随机楼层
+ * ========================================================================== */
+static int nearest_dist(const EchoState *st);
+static int nearest_pos(const EchoState *st);
+static bool monster_at(const EchoState *st, int depth);
+static bool monster_here(const EchoState *st);
+static void monster_step(EchoState *st);
+static void derive_danger(EchoState *st);
+static void spawn_monsters(EchoState *st);
+static int fragment_index_at(const EchoState *st, int depth);
+
+static int nearest_dist(const EchoState *st) {
+    int best = 9999;
+    for (int i = 0; i < st->monster_count; i++) {
+        int d = st->monsters[i] - st->depth;
+        if (d < 0) d = -d;
+        if (d < best) best = d;
+    }
+    return best;
+}
+static int nearest_pos(const EchoState *st) {
+    int best = 9999, pos = st->depth;
+    for (int i = 0; i < st->monster_count; i++) {
+        int d = st->monsters[i] - st->depth;
+        if (d < 0) d = -d;
+        if (d < best) { best = d; pos = st->monsters[i]; }
+    }
+    return pos;
+}
+static bool monster_at(const EchoState *st, int depth) {
+    for (int i = 0; i < st->monster_count; i++) {
+        if (st->monsters[i] == depth) return true;
+    }
+    return false;
+}
+static bool monster_here(const EchoState *st) {
+    return monster_at(st, st->depth);
+}
+
+/* 每回合推进怪物：被标记 → 朝信标 1~3 层；否则在附近游荡（±1 / 不动） */
+static void monster_step(EchoState *st) {
+    for (int i = 0; i < st->monster_count; i++) {
+        int *p = &st->monsters[i];
+        if (st->marked) {
+            int step = rand_int(st, CFG_HOMING_MIN, CFG_HOMING_MAX);
+            if (*p < st->mark_floor) *p = (*p + step > st->mark_floor) ? st->mark_floor : (*p + step);
+            else if (*p > st->mark_floor) *p = (*p - step < st->mark_floor) ? st->mark_floor : (*p - step);
+        } else {
+            /* 未被标记：在附近随机游荡（随机上下 1 层，或不动）—— 不朝玩家偏移 */
+            if (rand01(st) < CFG_WANDER_STEP) {
+                *p += (rand01(st) < 0.5 ? 1 : -1);
+            }
+        }
+        if (*p < 0) *p = 0;
+        if (*p > 100) *p = 100;
+    }
+
+    bool here = monster_here(st);
+    if (here && !st->fear_here) {
+        st->fear_here = true;
+        st->sanity -= CFG_SANITY_BREATH;
+        set_msg(st, "门外的脚步停下了。");
+        emit(st, EV_BREATH);
+    } else if (!here) {
+        st->fear_here = false;
+    }
+}
+
+/* 危险由「最近怪物距离」实时推导：越近越高，半径外归零。 */
+static void derive_danger(EchoState *st) {
+    int d = nearest_dist(st);
+    double r = CFG_DANGER_RADIUS;
+    double v = (d >= r) ? 0.0 : (1.0 - (double)d / r);
+    double val = CFG_DANGER_MAX * pow(v, 1.1);
+    st->danger = (double)((int)(val + 0.5));
+    if (st->danger < 0) st->danger = 0;
+    if (st->danger > CFG_DANGER_MAX) st->danger = CFG_DANGER_MAX;
+}
+
+static void spawn_monsters(EchoState *st) {
+    int n = CFG_MONSTER_COUNT;
+    if (n > ECHO_MAX_MONSTERS) n = ECHO_MAX_MONSTERS;
+    if (n < 1) n = 1;
+    int count = 0, guard = 0;
+    while (count < n && guard < 200) {
+        guard++;
+        int fl = CFG_MONSTER_SPAWN_MIN +
+                 (int)(rand01(st) * (double)(CFG_MONSTER_SPAWN_MAX - CFG_MONSTER_SPAWN_MIN + 1));
+        if (fl < CFG_MONSTER_SPAWN_MIN) fl = CFG_MONSTER_SPAWN_MIN;
+        if (fl > CFG_MONSTER_SPAWN_MAX) fl = CFG_MONSTER_SPAWN_MAX;
+        bool dup = false;
+        for (int k = 0; k < count; k++) if (st->monsters[k] == fl) dup = true;
+        if (dup) continue;
+        st->monsters[count++] = fl;
+    }
+    st->monster_count = count;
+}
+
+/* 公开查询（供主循环触发脚步音效等集成使用） */
+int echo_nearest_pos(const EchoState *st) { return nearest_pos(st); }
+int echo_nearest_dist(const EchoState *st) { return nearest_dist(st); }
+bool echo_monster_here(const EchoState *st) { return monster_here(st); }
+
+/* ==========================================================================
  * 新建一局
  * ========================================================================== */
+/* 碎片层：每局在 [MIN_DEPTH, MAX_DEPTH] 内纯随机抽 6 个不重复楼层（升序）。
+ * 玩家可以下去再上来，所以不做「必须早于 66 层」之类的约束。 */
+static void roll_fragment_depths(EchoState *st) {
+    const int lo = FRAGMENT_MIN_DEPTH, hi = FRAGMENT_MAX_DEPTH, n = FRAGMENT_DEPTH_COUNT;
+    bool picked[FRAGMENT_MAX_DEPTH + 2];
+    for (int i = 0; i <= hi + 1; i++) picked[i] = false;
+    int arr[FRAGMENT_DEPTH_COUNT];
+    int count = 0, guard = 0;
+    while (count < n && guard < 4000) {
+        guard++;
+        /* 用 hash32 而非 rand01：与 seed 强相关、分布均匀，且不消耗本局主随机流 */
+        uint32_t r = echo_hash32((uint32_t)st->seed ^ 0x5A17C0DEu, (uint32_t)(guard * 13 + 7));
+        int v = lo + (int)(r % (uint32_t)(hi - lo + 1));
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        if (picked[v]) continue;
+        picked[v] = true;
+        arr[count++] = v;
+    }
+    for (int v2 = lo; count < n && v2 <= hi; v2++) {
+        if (!picked[v2]) { picked[v2] = true; arr[count++] = v2; }
+    }
+    /* 升序（插入排序，n 很小） */
+    for (int i = 1; i < count; i++) {
+        int key = arr[i], j = i - 1;
+        while (j >= 0 && arr[j] > key) { arr[j + 1] = arr[j]; j--; }
+        arr[j + 1] = key;
+    }
+    for (int i = 0; i < FRAGMENT_DEPTH_COUNT; i++) {
+        st->fragment_depths[i] = (i < count) ? arr[i] : (lo + i);
+    }
+}
+
 void echo_new_game(EchoState *st, int32_t seed, const LastRun *last) {
     memset(st, 0, sizeof(*st));
     st->seed = (seed != 0) ? seed : 1;
     st->depth = 0;
-    st->food = 60.0;
+    st->food = CFG_FOOD_START;
     st->sanity = 100.0;
     st->health = 100.0;
     st->wear = 0.0;
@@ -155,8 +330,9 @@ void echo_new_game(EchoState *st, int32_t seed, const LastRun *last) {
     st->doors = 0;
     st->echoes = 0;
 
-    st->fear_pos = -25;
-    st->fear_mode = 0;
+    st->monster_count = 0;
+    st->marked = false;
+    st->mark_floor = -99;
     st->fear_here = false;
 
     st->phase = PHASE_IDLE;
@@ -170,6 +346,7 @@ void echo_new_game(EchoState *st, int32_t seed, const LastRun *last) {
     st->echo_fired = false;
 
     st->door_t = 0.0;
+    st->door_truth = false;
     st->door_result.type = FT_EMPTY;
     st->door_result.got_count = 0;
 
@@ -190,6 +367,9 @@ void echo_new_game(EchoState *st, int32_t seed, const LastRun *last) {
     st->turn = 0;
 
     st->rng = (uint32_t)st->seed ^ 0x1234567u;
+
+    roll_fragment_depths(st);
+    spawn_monsters(st);
 
     set_msg(st, echo_wear_line(st));
 }
@@ -238,7 +418,7 @@ int echo_compute_sig(EchoState *st, int depth) {
     if (!f) return ECHO_OPEN;
 
     int sig;
-    if (st->fear_pos == depth) sig = ECHO_ALIVE;
+    if (monster_at(st, depth)) sig = ECHO_ALIVE;
     else if (f->type == FT_ANOMALY) sig = ECHO_ALIVE;
     else if (f->type == FT_CLUTTER) sig = ECHO_BLOCKED;
     else sig = ECHO_OPEN;
@@ -246,7 +426,7 @@ int echo_compute_sig(EchoState *st, int depth) {
     bool was_seen = floor_flag(f, FLOOR_F_SEEN);
     floor_set(f, FLOOR_F_SEEN, true);
 
-    if (sig == ECHO_ALIVE && (st->fear_pos - depth >= -1 && st->fear_pos - depth <= 1)) {
+    if (sig == ECHO_ALIVE && abs(nearest_pos(st) - depth) <= 1) {
         if (rand01(st) < 0.35 + echo_ghost_weight(st, depth)) sig = ECHO_ANSWERED;
     }
 
@@ -264,36 +444,6 @@ int echo_compute_sig(EchoState *st, int depth) {
 }
 
 /* ==========================================================================
- * 它的移动
- * ========================================================================== */
-static void fear_step(EchoState *st) {
-    st->fear_mode = (st->danger >= CFG_DANGER_HUNT) ? 1 : 0;
-    if (st->fear_mode == 1) {
-        if (st->fear_pos < st->depth) st->fear_pos += 1;
-        else if (st->fear_pos > st->depth) st->fear_pos -= 1;
-    } else {
-        double r = rand01(st);
-        if (r < 0.40) {
-            if (st->fear_pos < st->depth) st->fear_pos += 1;
-            else if (st->fear_pos > st->depth) st->fear_pos -= 1;
-        } else if (r < 0.75) {
-            st->fear_pos += (rand01(st) < 0.5 ? 1 : -1);
-        }
-    }
-    if (st->fear_pos < -2) st->fear_pos = -2;
-    if (st->fear_pos == st->depth) {
-        if (!st->fear_here) {
-            st->fear_here = true;
-            st->sanity -= CFG_SANITY_BREATH;
-            set_msg(st, "门外的脚步停下了。");
-            emit(st, EV_BREATH);
-        }
-    } else {
-        st->fear_here = false;
-    }
-}
-
-/* ==========================================================================
  * 恐怖手法
  * ========================================================================== */
 static void advance_tricks(EchoState *st) {
@@ -302,11 +452,7 @@ static void advance_tricks(EchoState *st) {
     st->trick_silent--;
     if (st->trick_silent <= 0) {
         st->trick_silent = rand_int(st, CFG_TRICK_SILENT_MIN, CFG_TRICK_SILENT_MAX);
-        if (d >= CFG_TRICK_DEPTH_SILENT) {
-            emit(st, EV_SILENT_ECHO);
-            st->danger += CFG_DANGER_SILENT;
-            if (st->danger > CFG_DANGER_MAX) st->danger = CFG_DANGER_MAX;
-        }
+        if (d >= CFG_TRICK_DEPTH_SILENT) emit(st, EV_SILENT_ECHO);
     }
 
     st->trick_cut--;
@@ -319,7 +465,7 @@ static void advance_tricks(EchoState *st) {
     if (st->trick_ahead <= 0) {
         st->trick_ahead = rand_int(st, CFG_TRICK_AHEAD_MIN, CFG_TRICK_AHEAD_MAX);
         if (d >= CFG_TRICK_DEPTH_AHEAD) {
-            int above = d - st->fear_pos;
+            int above = d - nearest_pos(st);
             if (above > 0 && above <= 4) {
                 emit(st, EV_AHEAD);
                 st->sanity -= CFG_SANITY_AHEAD;
@@ -354,7 +500,8 @@ static void end_turn(EchoState *st) {
     if (st->ended != -1) return;
     st->turn++;
 
-    fear_step(st);
+    monster_step(st);
+    derive_danger(st);
 
     double s_drain = (st->food > 0 ? CFG_SANITY_FED : CFG_SANITY_HUNGRY);
     if (st->health <= CFG_HEALTH_LOW) s_drain *= CFG_SANITY_LOW_MULT;
@@ -397,9 +544,6 @@ static int move(EchoState *st, int dir) {
     st->food -= CFG_FOOD_MOVE;
     if (st->food < 0) st->food = 0;
 
-    st->danger += CFG_DANGER_MOVE;
-    if (st->danger > CFG_DANGER_MAX) st->danger = CFG_DANGER_MAX;
-
     set_msg(st, echo_wear_line(st));
     emit(st, dir > 0 ? EV_MOVE_DOWN : EV_MOVE_UP);
     floor_at(st, st->depth);
@@ -408,24 +552,14 @@ static int move(EchoState *st, int dir) {
     return 1;
 }
 
-/* 真结局（好结局）：集齐碎片后你终于「听得懂回声」，回声反过来替你指路，
- * 电梯第一次向上，你走出了这栋楼。
- * 控制在 45 字以内：结局区从 y=136 起、每行 15 字，3 行恰好在 y=196 的结算行之前结束。 */
+/* 真结局（好结局）：集齐 6 张碎片后，在 66 层开门，回声反过来替你指路，
+ * 电梯第一次向上，你走出了这栋楼（六六大顺）。控制在合理长度内。 */
 static const char *truth_text(void) {
-    return "你呼喊了三声。回声替你指了路——向上。门开了，外面是有风的清晨。你走了出去，没有回头。";
+    return "六张碎片拼齐，停在第六十六层。六个六，凑成了顺。门开了，外面是纯白的光，白得没有影子，白得看不见地面。你记得老人们说，顺是吉兆；也记得，数到第三个六，是另一个名字。光把你吞了进去。你没有回头。";
 }
 
 static int start_echo(EchoState *st) {
     if (!can_act(st)) return 0;
-    /* 集齐全部碎片后，呼喊揭示真相，打破循环 */
-    if (st->fragments >= FRAGMENT_DEPTH_COUNT) {
-        st->ended = END_TRUTH;
-        st->phase = PHASE_OVER;
-        st->flash = 1.0;
-        set_msg(st, truth_text());
-        emit(st, EV_TRUTH);
-        return 1;
-    }
     st->phase = PHASE_ECHOING;
     st->echo_t = 0.0;
     st->echo_fired = false;
@@ -434,8 +568,12 @@ static int start_echo(EchoState *st) {
 
     st->food -= CFG_FOOD_ECHO;
     if (st->food < 0) st->food = 0;
-    st->danger += CFG_DANGER_ECHO;
-    if (st->danger > CFG_DANGER_MAX) st->danger = CFG_DANGER_MAX;
+
+    /* 标记信标：每次呼喊都把「你所在的层」设为信标（再次呐喊 = 刷新被标记的楼层）。
+     * 怪物被标记后朝信标移动；停止呼喊，信标滞留旧层，怪物抵达后转为游荡——
+     * 你靠不呼喊来甩脱。 */
+    st->marked = true;
+    st->mark_floor = st->depth;
 
     if (st->run_echo_count < ECHO_MAX_ECHO_DEPTHS) {
         st->run_echoes[st->run_echo_count++] = st->depth;
@@ -447,26 +585,65 @@ static int start_echo(EchoState *st) {
     return 1;
 }
 
-/* 聆听结果：只分「很远 / 远处 / 很近 / 就在门外」四档，不给出相隔层数。
- * 近距离那一档连上下都不透露——玩家无法靠反复聆听精确定位它。
- * （原先细分为 >8 / >4 / >1 / ==1 / ==0 五档，区间过窄，等于报出了大致层数。） */
-static const char *describe_listen(const EchoState *st) {
-    int d = st->fear_pos - st->depth;
-    int ad = d < 0 ? -d : d;
-    if (ad >= 8) return "井道深处很安静。安静得像是有什么在屏息";
-    if (ad >= 3) return (d > 0) ? "远处有东西在动，声音贴着井壁往下走"
-                                : "远处有东西在动，声音贴着井壁往上走";
-    if (ad >= 1) return "很近了。近到你分不清它究竟在上还是在下";
-    return "声音就在门外面";
+/* 聆听结果：只分四档，不给出相隔层数，近距离连上下都不透露。
+ * 贴脸（同层）与相邻（1 层）合并为同一档「它就在这一带」。 */
+static const char *describe_listen(EchoState *st) {
+    int ad = nearest_dist(st);
+    int tier = ad >= 12 ? 0 : ad >= 6 ? 1 : ad >= 2 ? 2 : 3;
+    const char *txt = LISTEN_TIERS[tier];
+    double l = echo_lie_chance(st);   /* 0（理智高）~ 约 0.7（理智极低） */
+    if (st->sanity < CFG_SANITY_LIE_HARD) {
+        if (rand01(st) < l * 0.6) txt = LISTEN_HALLUC[rand_int(st, 0, 2)];
+    } else if (l > 0) {
+        if (rand01(st) < l) {
+            int t2 = tier + (rand01(st) < 0.5 ? 1 : -1);
+            if (t2 < 0) t2 = 0;
+            if (t2 > 3) t2 = 3;
+            txt = LISTEN_TIERS[t2];
+        }
+    }
+    return txt;
+}
+
+/* 碎片线索：本层有碎片 → 回声被门缝吸住；隔壁有碎片 → 井道里有一层是哑的。 */
+static int fragment_index_at(const EchoState *st, int depth) {
+    for (int i = 0; i < FRAGMENT_DEPTH_COUNT; i++) {
+        if (st->fragment_depths[i] == depth) return i;
+    }
+    return -1;
+}
+
+static const char *frag_hint(EchoState *st) {
+    Floor *f = floor_at(st, st->depth);
+    if (f && floor_flag(f, FLOOR_F_FRAGMENT) && !floor_flag(f, FLOOR_F_FRAGMENT_TAKEN)) {
+        return FRAG_HINT_HERE[rand_int(st, 0, 2)];
+    }
+    for (int i = 0; i < FRAGMENT_DEPTH_COUNT; i++) {
+        int d = st->fragment_depths[i];
+        if (d < 0) continue;
+        if (abs(d - st->depth) == 1) {
+            Floor *nf = floor_at(st, d);
+            if (nf && floor_flag(nf, FLOOR_F_FRAGMENT) && !floor_flag(nf, FLOOR_F_FRAGMENT_TAKEN)) {
+                return FRAG_HINT_NEAR[rand_int(st, 0, 2)];
+            }
+        }
+    }
+    return NULL;
 }
 
 static int start_listen(EchoState *st) {
     if (!can_act(st)) return 0;
     st->food -= CFG_FOOD_LISTEN;
     if (st->food < 0) st->food = 0;
-    st->danger -= CFG_DANGER_LISTEN;
-    if (st->danger < 0) st->danger = 0;
-    set_msg(st, describe_listen(st));
+
+    const char *dl = describe_listen(st);
+    const char *fh = frag_hint(st);
+    if (fh) {
+        snprintf(st->msg, sizeof(st->msg), "%s　%s", dl, fh);
+    } else {
+        set_msg(st, dl);
+    }
+
     emit(st, EV_LISTEN);
     end_turn(st);
     return 1;
@@ -475,14 +652,14 @@ static int start_listen(EchoState *st) {
 static int open_door(EchoState *st) {
     st->phase = PHASE_DOOR;
     st->door_t = 0.0;
+    st->door_truth = false;
     st->doors++;
+    emit(st, EV_DOOR);
 
     st->wear += CFG_WEAR_DOOR;
     if (st->wear > CFG_WEAR_MAX) st->wear = CFG_WEAR_MAX;
     st->food -= CFG_FOOD_DOOR;
     if (st->food < 0) st->food = 0;
-    st->danger += CFG_DANGER_DOOR;
-    if (st->danger > CFG_DANGER_MAX) st->danger = CFG_DANGER_MAX;
 
     Floor *f = floor_at(st, st->depth);
     if (!f) { end_turn(st); return 0; }
@@ -490,8 +667,17 @@ static int open_door(EchoState *st) {
     floor_type_t ft = (floor_type_t)f->type;
     int got = 0;
 
-    if (st->fear_pos == st->depth || ft == FT_ANOMALY) {
-        bool it_here = (st->fear_pos == st->depth);
+    /* 真结局：集满 6 张碎片，且在 66 层开门——六六大顺（优先于一切门后结果） */
+    if (st->fragments >= FRAGMENT_DEPTH_COUNT && st->depth == 66) {
+        st->door_truth = true;
+        st->door_result.type = ft;
+        st->door_result.got_count = 0;
+        set_msg(st, "六十六层。门，开了。");
+        return 1;   /* 不 endTurn：等开门演出结束，由 tick 收尾转入结局 */
+    }
+
+    if (monster_at(st, st->depth) || ft == FT_ANOMALY) {
+        bool it_here = monster_at(st, st->depth);
         int lo = it_here ? CFG_HEALTH_HIT_IT_MIN : CFG_HEALTH_HIT_ANOMALY_MIN;
         int hi = it_here ? CFG_HEALTH_HIT_IT_MAX : CFG_HEALTH_HIT_ANOMALY_MAX;
         st->health -= rand_int(st, lo, hi);
@@ -520,21 +706,24 @@ static int open_door(EchoState *st) {
         got = 1;
         emit(st, EV_EGG);
     } else if (floor_flag(f, FLOOR_F_TOOL)) {
-        double eff = CFG_REPAIR_MIN;
-        double e = 1.0 - st->repairs * CFG_REPAIR_DECAY;
-        if (e > eff) eff = e;
-        double fix = CFG_REPAIR_BASE * eff;
+        /* 递减：45 → 32.4 → 23.3 → 16.8 → 12.1 → 到底 12。保底每次仍回 12% 耐久度。 */
+        double raw = CFG_REPAIR_BASE * pow(CFG_REPAIR_DECAY, (double)st->repairs);
+        bool floored = raw <= CFG_REPAIR_FLOOR;
+        double fix = floored ? CFG_REPAIR_FLOOR : raw;
         st->wear -= fix;
         if (st->wear < 0) st->wear = 0;
         st->repairs++;
         static const char *rep_fmt[] = {
-            "你找到一些工具，尝试加固了电梯（第 %d 次修复，效果 %d%%）",
-            "你摸到一些工具。你加固了电梯。第 %d 次修复，效果 %d%%。",
+            "你找到一些工具，尝试加固了电梯（第 %d 次修复，回 %d%% 耐久）",
+            "你摸到一些工具。你加固了电梯。第 %d 次，回 %d%% 耐久。",
             "你找到一些工具。电梯又稳了一些。第 %d 次。"
         };
         int ri = (int)(rand01(st) * 3) % 3;
         snprintf(st->msg, sizeof(st->msg), rep_fmt[ri],
-                 st->repairs, (int)(eff * 100.0 + 0.5));
+                 st->repairs, (int)(fix + 0.5));
+        if (floored) {
+            strncat(st->msg, " 再修也只能这样了。", sizeof(st->msg) - strlen(st->msg) - 1);
+        }
         got = 1;
         emit(st, EV_REPAIR);
     } else if (floor_flag(f, FLOOR_F_UNKNOWN_FOOD)) {
@@ -547,12 +736,15 @@ static int open_door(EchoState *st) {
         st->pending_unknown = true;
         got = 1;
         emit(st, EV_UNKNOWN_FOOD);
-    } else if (floor_flag(f, FLOOR_F_FRAGMENT)) {
+    } else if (floor_flag(f, FLOOR_F_FRAGMENT) && !floor_flag(f, FLOOR_F_FRAGMENT_TAKEN)) {
         st->fragments++;
+        floor_set(f, FLOOR_F_FRAGMENT_TAKEN, true);
+        int idx = fragment_index_at(st, st->depth);
+        const char *txt = fragment_text(idx);
         if (st->fragments >= FRAGMENT_DEPTH_COUNT) {
-            snprintf(st->msg, sizeof(st->msg), "%s 六张碎片拼齐了。你现在听得懂回声了。", fragment_text(st->depth));
+            snprintf(st->msg, sizeof(st->msg), "%s 六张碎片拼齐了。该去凑最后一道顺了。", txt);
         } else {
-            set_msg(st, fragment_text(st->depth));
+            set_msg(st, txt);
         }
         got = 1;
         emit(st, EV_FRAGMENT);
@@ -568,14 +760,17 @@ static int open_door(EchoState *st) {
         got = 1;
         emit(st, EV_HOPE);
     } else if (floor_flag(f, FLOOR_F_LOOT)) {
+        double before = st->food;
         st->food += 40.0;
-        if (st->food > CFG_FOOD_MAX) st->food = CFG_FOOD_MAX;
+        if (st->food > CFG_FOOD_CAP) st->food = CFG_FOOD_CAP;
         static const char *loot_msgs[] = {
             "你摸到几包还没过期的东西",
             "你找到一些吃的。还能吃。",
             "角落里有一份东西。是食物。"
         };
-        set_msg(st, loot_msgs[(int)(rand01(st) * 3) % 3]);
+        const char *lm = loot_msgs[(int)(rand01(st) * 3) % 3];
+        if (st->food - before < 40.0) lm = "你找到一些吃的。你只拿得动这些了。";
+        set_msg(st, lm);
         got = 1;
         emit(st, EV_LOOT);
     } else {
@@ -600,7 +795,7 @@ static int eat_unknown(EchoState *st) {
     if (!st->pending_unknown) return 0;
     st->pending_unknown = false;
     st->ate_unknown = true;
-    st->food = CFG_FOOD_MAX;
+    st->food = CFG_FOOD_CAP;
     st->sanity -= CFG_SANITY_UNSEEN;
     set_msg(st, "你吃了。味道说不上来。");
     emit(st, EV_ATE);
@@ -623,16 +818,14 @@ static int decline_unknown(EchoState *st) {
  * 面板
  * ========================================================================== */
 int echo_panel_items(const EchoState *st, PanelItem *out) {
-    bool truth_ready = st->fragments >= FRAGMENT_DEPTH_COUNT;
     int n = 0;
-
-    out[n++] = (PanelItem){ "echo",   "呼喊", truth_ready ? "打破循环" : "呼喊，听回声" };
+    out[n++] = (PanelItem){ "echo",   "呼喊", "回声探测本层" };
     if (st->pending_unknown) {
         out[n++] = (PanelItem){ "eat", "不明食物", "恢复食物失去理智" };
     }
-    out[n++] = (PanelItem){ "listen", "聆听", "降危险，听得清" };
-    out[n++] = (PanelItem){ "door",   "开门", "不可逆" };
-    out[n++] = (PanelItem){ "back",   "返回", "关闭本面板" };
+    out[n++] = (PanelItem){ "listen", "聆听", "模糊感知" };
+    out[n++] = (PanelItem){ "door",   "开门", "面对未知" };
+    out[n++] = (PanelItem){ "back",   "返回", "" };
     return n;
 }
 
@@ -693,7 +886,15 @@ void echo_tick(EchoState *st, double dt_ms) {
 
     if (st->phase == PHASE_DOOR) {
         st->door_t += dt_ms;
-        if (st->door_t >= CFG_DOOR_MS) st->phase = PHASE_IDLE;
+        if (st->door_t >= CFG_DOOR_MS) {
+            if (st->door_truth) {
+                st->ended = END_TRUTH;
+                st->phase = PHASE_OVER;
+                emit(st, EV_TRUTH);
+            } else {
+                st->phase = PHASE_IDLE;
+            }
+        }
     }
 
     if (st->flash > 0) st->flash -= dt_ms / 1000.0;
