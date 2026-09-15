@@ -480,37 +480,39 @@ static void draw_panel(uint16_t *fb, const EchoState *st) {
 /* ---------------------------------------------------------------------
  * 结局
  * ------------------------------------------------------------------- */
+/* 折行辅助（实现在文件后部，见 draw_wrapped_scroll 之上） */
+static int wrap_line_end(const char *s, int len, int start, int limit);
+
 static void draw_end(uint16_t *fb, const EchoState *st, uint32_t tms) {
     fill_rect(fb, 0, 0, ECHO_W, ECHO_H, C_INK);
 
+    /* 标题统一取自 echo_end_titles()，与历史档案显示的名字完全一致；
+     * 彩蛋用具体 EggDef 的名字（每个彩蛋一个）。 */
     const char *title;
-    switch (st->ended) {
-        case END_TRUTH:   title = "回声引路"; break;   /* 真结局＝好结局：回声指路，你走了出去 */
-        case END_STARVED: title = "你耗尽了"; break;
-        case END_EGG:     title = st->egg ? st->egg->title : "彩蛋"; break;
-        case END_BECAME:  title = "你成了下一个它"; break;
-        case END_MADNESS: title = "理智归零"; break;
-        case END_TAKEN:   title = "它带走了你"; break;
-        default:          title = "电梯停了"; break;
+    if (st->ended == END_EGG) {
+        title = st->egg ? st->egg->title : "彩蛋";
+    } else if (st->ended >= 0 && st->ended < END_COUNT) {
+        title = echo_end_titles()[st->ended];
+    } else {
+        title = echo_end_titles()[END_STALLED];
     }
     draw_text(fb, title, ECHO_W / 2, 96, C_AMBER, ALIGN_CENTER);
 
-    /* 结局文案，17 字折行居中 */
+    /* 结局文案，14 字折行居中（14×16=224，两端各留 8px 边距）。
+     * 屏高有限：正文区只够 3 行（136/152/168，底部 184 在统计行 196 之上）。
+     * 更长的正文（如真结局）在结局画面只显示开头，全文到「历史」档案里看——
+     * 不截断的话会盖住下方的「最深 / 得分」。 */
     const char *et = echo_end_text(st);
     int len = (int)strlen(et);
-    int line = 0, start = 0, cnt = 0;
-    for (int i = 0; i < len; ) {
-        int adv; utf8_decode(et + i, &adv);
-        i += adv; cnt++;
-        /* 每行 15 字居中：15 × 16 = 240px 正好等于屏宽。
-         * 原为 17 字（272px），居中后 x 起点为 -16，左右各被裁掉 1 字。 */
-        if (cnt >= 15) {
-            draw_text_n(fb, et + start, i - start, ECHO_W / 2, 136 + line * 16, C_TEXT, ALIGN_CENTER);
-            line++; start = i; cnt = 0;
-        }
+    int line = 0, start = 0;
+    while (start < len) {
+        int end = wrap_line_end(et, len, start, 28);   /* 28 半角单位 = 14 全角字 */
+        if (end <= start) end = start + 1;
+        if (line < 3)
+            draw_text_n(fb, et + start, end - start, ECHO_W / 2,
+                        136 + line * 16, C_TEXT, ALIGN_CENTER);
+        line++; start = end;
     }
-    if (start < len)
-        draw_text_n(fb, et + start, len - start, ECHO_W / 2, 136 + line * 16, C_TEXT, ALIGN_CENTER);
 
     char buf[40];
     snprintf(buf, sizeof(buf), "最深 B%d　碎片 %d", st->max_depth, st->fragments);
@@ -589,12 +591,12 @@ static void draw_menu_main(uint16_t *fb, const MenuState *m) {
         draw_text(fb, sel ? "> 音量" : "  音量", 40, iy + 6,
                   sel ? C_AMBER : C_TEXT, ALIGN_LEFT);
     }
-    /* 项 3：说明 */
+    /* 项 3：历史（回声档案：结局 / 彩蛋 / 碎片） */
     {
         int iy = 240, sel = (m->sel == 3);
         if (sel) { fill_rect(fb, bar_x, iy, bar_w, bar_h, C_METAL);
                     rect_outline(fb, bar_x, iy, bar_w, bar_h, C_AMBER); }
-        draw_text(fb, sel ? "> 说明" : "  说明", 40, iy + 6,
+        draw_text(fb, sel ? "> 历史" : "  历史", 40, iy + 6,
                   sel ? C_AMBER : C_TEXT, ALIGN_LEFT);
     }
 
@@ -625,6 +627,145 @@ static void draw_menu_volume(uint16_t *fb, const MenuState *m) {
     draw_text(fb, "↑↓ 调整 · OK 返回", ECHO_W / 2, 210, C_FAINT, ALIGN_CENTER);
 }
 
+/* ---------------------------------------------------------------------
+ * 可滚动折行文本（历史详情用）
+ * 按每行 max_chars 个字符切分，左对齐从 (x, y) 起绘制，行高 lh。
+ * skip_lines：跳过前 N 行（滚动）；max_lines：最多画几行（超出裁掉）。
+ * 返回总行数，供调用方夹取滚动范围。
+ * ------------------------------------------------------------------- */
+/* 求「从 start 起、宽度不超过 limit（半角单位：全角 2 / 半角 1）的一行」的结束偏移。
+ * 连续半角串（如 B37、第 47 个里的 47）不从中拆开：若断点落在串中间，
+ * 就回溯到串首，把整串挪到下一行。 */
+static int wrap_line_end(const char *s, int len, int start, int limit) {
+    int i = start, w = 0;
+    while (i < len) {
+        int adv; utf8_decode(s + i, &adv);
+        if (adv <= 0) adv = 1;
+        int cw = ((unsigned char)s[i] < 0x80) ? 1 : 2;
+        if (w + cw > limit) {
+            if ((unsigned char)s[i] < 0x80 && i > start) {
+                int j = i;
+                while (j > start && (unsigned char)s[j - 1] < 0x80) j--;
+                if (j > start) return j;         /* 整串挪到下一行 */
+            }
+            return i;
+        }
+        w += cw; i += adv;
+    }
+    return len;
+}
+
+static int draw_wrapped_scroll(uint16_t *fb, const char *s, int x, int y,
+                               int max_chars, int lh, uint16_t c,
+                               int skip_lines, int max_lines) {
+    if (!s || max_chars <= 0) return 0;
+    int len = (int)strlen(s);
+    int limit = max_chars * 2;      /* 半角单位上限（全角 2、半角 1） */
+    int line = 0, start = 0;
+    while (start < len) {
+        int end = wrap_line_end(s, len, start, limit);
+        if (end <= start) end = start + 1;       /* 兜底，防死循环 */
+        if (line >= skip_lines && line - skip_lines < max_lines)
+            draw_text_n(fb, s + start, end - start, x,
+                        y + (line - skip_lines) * lh, c, ALIGN_LEFT);
+        line++; start = end;
+    }
+    return line;
+}
+
+/* ---------------------------------------------------------------------
+ * 历史档案（列表 / 详情）
+ * ------------------------------------------------------------------- */
+/* 纵向节奏（字模高 16，每处留出足够行距，避免文字与分隔线/相邻行相撞） */
+#define HIST_TITLE_Y  20
+#define HIST_STAT_Y   40
+#define HIST_DIV_Y    60      /* 标题区与列表/正文之间的分隔线 */
+#define HIST_LIST_TOP 66
+#define HIST_LIST_BOT 286
+#define HIST_ROW_H    22
+
+static void draw_menu_history(uint16_t *fb, const MenuState *m) {
+    HistView *v = (HistView *)&m->hist;
+
+    /* ---- 详情：条目标题 + 正文（不显示统计行，避免与标题重叠） ---- */
+    if (v->detail >= 0 && v->detail < v->count) {
+        const HistItem *it = &v->items[v->detail];
+        const char *title = echo_hist_item_title(it);
+        draw_text(fb, title ? title : "？？？", ECHO_W / 2, HIST_TITLE_Y,
+                  title ? C_AMBER : C_DIM, ALIGN_CENTER);
+        fill_rect(fb, 30, HIST_STAT_Y + 6, ECHO_W - 60, 1, C_METALHI);
+
+        const char *body = echo_hist_item_text(&m->archive, it);
+        int rows = (HIST_DET_BOT - HIST_DET_TOP) / HIST_DET_LH;
+        int total = body ? draw_wrapped_scroll(fb, body, 12, HIST_DET_TOP, 13,
+                                               HIST_DET_LH, C_TEXT,
+                                               v->dscroll, rows) : 0;
+        v->dlines = total;   /* 输入层据此夹取滚动范围 */
+        if (total > rows && body) {
+            /* 右侧细滚动条 */
+            int track_h = HIST_DET_BOT - HIST_DET_TOP;
+            int th = track_h * rows / total;
+            if (th < 8) th = 8;
+            int ty = HIST_DET_TOP + (track_h - th) * v->dscroll / (total - rows);
+            fill_rect(fb, ECHO_W - 6, HIST_DET_TOP, 2, track_h, C_METALLO);
+            fill_rect(fb, ECHO_W - 6, ty, 2, th, C_AMBER);
+        }
+        draw_text(fb, "↑↓ 翻阅 · OK 返回", ECHO_W / 2, 296, C_FAINT, ALIGN_CENTER);
+        return;
+    }
+
+    /* ---- 列表：标题 + 统计 + 分隔线 + 列表 ---- */
+    draw_text(fb, "历 史", ECHO_W / 2, HIST_TITLE_Y, C_AMBER, ALIGN_CENTER);
+
+    int nE = 0, nF = 0;
+    echo_hist_count(&m->archive, &nE, &nF);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "结局 %d/%d　碎片 %d/%d",
+             nE, echo_hist_total_ends(), nF, FRAGMENT_DEPTH_COUNT);
+    draw_text(fb, buf, ECHO_W / 2, HIST_STAT_Y, C_DIM, ALIGN_CENTER);
+    fill_rect(fb, 30, HIST_DIV_Y, ECHO_W - 60, 1, C_METALHI);
+
+    int rows = echo_hist_visible_rows(HIST_LIST_TOP, HIST_LIST_BOT, HIST_ROW_H);
+    echo_hist_ensure_visible(v, rows);
+
+    for (int r = 0; r < rows; r++) {
+        int idx = v->scroll + r;
+        if (idx < 0 || idx >= v->count) break;
+        const HistItem *it = &v->items[idx];
+        int iy = HIST_LIST_TOP + r * HIST_ROW_H;
+
+        /* draw_text 的 y 是字模顶部；行高 22、字高 16，故 +3 垂直居中 */
+        if (it->kind == HIST_HEAD) {
+            draw_text_spaced(fb, it->title ? it->title : "", 12, iy + 3,
+                             C_AMBER, ALIGN_LEFT, 2);
+            continue;
+        }
+        bool sel = (idx == v->sel);
+        if (sel) {
+            fill_rect(fb, 10, iy + 1, ECHO_W - 20, HIST_ROW_H - 2, C_METAL);
+            fill_rect(fb, 10, iy + 1, 2, HIST_ROW_H - 2, C_AMBER);
+        }
+        uint16_t tc = sel ? C_AMBER : (it->unlocked ? C_TEXT : C_FAINT);
+        draw_text(fb, it->unlocked && it->title ? it->title : "？？？",
+                  20, iy + 3, tc, ALIGN_LEFT);
+        draw_text(fb, it->unlocked ? "已解锁" : "未解锁",
+                  ECHO_W - 16, iy + 4,
+                  sel ? C_DIM : C_FAINT, ALIGN_RIGHT);
+    }
+
+    /* 滚动条 */
+    if (v->count > rows) {
+        int track_h = HIST_LIST_BOT - HIST_LIST_TOP;
+        int th = track_h * rows / v->count;
+        if (th < 8) th = 8;
+        int ty = HIST_LIST_TOP + (track_h - th) * v->scroll / (v->count - rows);
+        fill_rect(fb, ECHO_W - 6, HIST_LIST_TOP, 2, track_h, C_METALLO);
+        fill_rect(fb, ECHO_W - 6, ty, 2, th, C_AMBER);
+    }
+
+    draw_text(fb, "↑↓ 选择 · OK 查看 · 长按OK 返回", ECHO_W / 2, 296, C_FAINT, ALIGN_CENTER);
+}
+
 static void draw_menu_help(uint16_t *fb, const MenuState *m) {
     (void)m;
     draw_text(fb, "说明", ECHO_W / 2, 40, C_AMBER, ALIGN_CENTER);
@@ -645,8 +786,9 @@ void echo_render_menu(const MenuState *m, uint16_t *fb, uint32_t tms) {
     (void)tms;
     fill_rect(fb, 0, 0, ECHO_W, ECHO_H, C_BG);
     draw_frame_border(fb);
-    if (m->screen == MENU_VOLUME) { draw_menu_volume(fb, m); return; }
-    if (m->screen == MENU_HELP)   { draw_menu_help(fb, m); return; }
+    if (m->screen == MENU_VOLUME)  { draw_menu_volume(fb, m); return; }
+    if (m->screen == MENU_HISTORY) { draw_menu_history(fb, m); return; }
+    if (m->screen == MENU_HELP)    { draw_menu_help(fb, m); return; }
     draw_menu_main(fb, m);
 }
 

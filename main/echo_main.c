@@ -28,6 +28,7 @@
 
 #include "echo_core.h"
 #include "echo_render.h"
+#include "echo_history.h"
 #include "echo_audio.h"
 #include "sfx_table.h"
 
@@ -304,6 +305,40 @@ static void menu_dispatch(uint8_t btn, uint8_t ev) {
         }
         return;
     }
+    if (s_menu.screen == MENU_HISTORY) {
+        HistView *v = &s_menu.hist;
+        if (v->detail >= 0) {
+            /* 详情：上下翻正文，OK 返回列表 */
+            if (ev == BTN_PRESS && btn == BTN_UP) {
+                if (v->dscroll > 0) v->dscroll--;
+                post_sfx(SFX_BLIP, 0);
+            } else if (ev == BTN_PRESS && btn == BTN_DOWN) {
+                int maxd = v->dlines - HIST_DET_ROWS;
+                if (maxd < 0) maxd = 0;
+                if (v->dscroll < maxd) v->dscroll++;
+                post_sfx(SFX_BLIP, 0);
+            } else if (btn == BTN_OK) {      /* 短按/长按都返回列表 */
+                v->detail = -1; v->dscroll = 0;
+                post_sfx(SFX_BLIP, 0);
+            }
+            return;
+        }
+        /* 列表 */
+        if (ev == BTN_PRESS && btn == BTN_UP) {
+            echo_hist_move(v, -1); post_sfx(SFX_BLIP, 0);
+        } else if (ev == BTN_PRESS && btn == BTN_DOWN) {
+            echo_hist_move(v, 1); post_sfx(SFX_BLIP, 0);
+        } else if (btn == BTN_OK && ev == BTN_LONG) {
+            s_menu.screen = MENU_MAIN; post_sfx(SFX_BLIP, 0);
+        } else if (btn == BTN_OK && ev == BTN_PRESS) {
+            /* 只有已解锁的条目能进详情（未解锁不剧透） */
+            if (v->sel >= 0 && v->sel < v->count && v->items[v->sel].unlocked) {
+                v->detail = v->sel; v->dscroll = 0; v->dlines = 0;
+                post_sfx(SFX_BLIP, 0);
+            }
+        }
+        return;
+    }
     /* 主菜单 */
     if (ev != BTN_PRESS) return;
     if (btn == BTN_UP)      { s_menu.sel = menu_prev(s_menu.sel); post_sfx(SFX_BLIP, 0); }
@@ -312,7 +347,12 @@ static void menu_dispatch(uint8_t btn, uint8_t ev) {
         if (s_menu.sel == 0) start_game(false);
         else if (s_menu.sel == 1) { if (s_menu.has_continue) start_game(true); }
         else if (s_menu.sel == 2) { s_menu.screen = MENU_VOLUME; post_sfx(SFX_BLIP, 0); }
-        else                      { s_menu.screen = MENU_HELP;   post_sfx(SFX_BLIP, 0); }
+        else {  /* 历史：每次进入都重新读档，保证看到的是最新解锁 */
+            echo_hist_load(&s_menu.archive);
+            echo_hist_build(&s_menu.hist, &s_menu.archive);
+            s_menu.screen = MENU_HISTORY;
+            post_sfx(SFX_BLIP, 0);
+        }
     }
 }
 
@@ -359,7 +399,8 @@ static void dispatch_sfx(event_t ev) {
         case EV_LISTEN:
         case EV_REPAIR:      post_sfx(SFX_BLIP, 0); break;
         case EV_ENCOUNTER:
-        case EV_EGG:         post_sfx(SFX_STINGER, 0); break;
+        case EV_EGG:
+        case EV_STRANDED:    post_sfx(SFX_STINGER, 0); break;
         case EV_BREATH:      post_sfx(SFX_BREATH, 0); break;
         case EV_SILENT_ECHO: s_silent_echo_at_ms = now_ms() + 400; break;
         case EV_AMBIENCE_CUT:s_amb_on = false; s_amb_cut_until_ms = now_ms() + 2600; break;
@@ -427,6 +468,10 @@ static void game_loop(void) {
             if (s_st.ended != -1 && !s_saved) {
                 s_saved = true;
                 save_run();
+                /* 历史档案：登记本局解锁的结局 / 彩蛋 / 碎片 */
+                echo_hist_load(&s_menu.archive);
+                echo_hist_record(&s_menu.archive, &s_st);
+                echo_hist_save(&s_menu.archive);
                 clear_continue();
                 s_amb_on = false;
             }

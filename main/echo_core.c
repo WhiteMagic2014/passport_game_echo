@@ -55,7 +55,8 @@ static const EggDef EGGS[] = {
     { 66, "大顺",       "六六大顺。可电梯偏偏在这一层卡住了，像在提醒你：这趟从没顺过。" },
     { 88, "再见",       "B88。88，再见。你想跟谁道个别，却怎么也想不起那个名字。" }
 };
-#define EGG_COUNT (sizeof(EGGS) / sizeof(EGGS[0]))
+/* EGG_COUNT 定义在 echo_core.h（历史档案需要它做静态数组维度）。
+ * 增删彩蛋时必须同步修改 echo_core.h 的 EGG_COUNT，且表要按楼层升序。 */
 
 const EggDef *echo_egg_at(int depth) {
     for (size_t i = 0; i < EGG_COUNT; i++) {
@@ -64,10 +65,36 @@ const EggDef *echo_egg_at(int depth) {
     return NULL;
 }
 
+const EggDef *echo_egg_by_index(int i) {
+    if (i < 0 || i >= EGG_COUNT) return NULL;
+    return &EGGS[i];
+}
+
+int echo_egg_index_of(int depth) {
+    for (int i = 0; i < EGG_COUNT; i++) {
+        if (EGGS[i].depth == depth) return i;
+    }
+    return -1;
+}
+
+/* 结局标题（按 end_t 下标），历史档案列未解锁条目时用。
+ * END_EGG 那格只是占位，实际显示具体彩蛋的 title。 */
+static const char *const END_TITLES[END_COUNT] = {
+    "电梯停了",        /* 0 STALLED  */
+    "理智归零",        /* 1 MADNESS  */
+    "它带走了你",      /* 2 TAKEN    */
+    "你成了下一个它",  /* 3 BECAME   */
+    "彩蛋楼层",        /* 4 EGG（占位） */
+    "六六大顺",        /* 5 TRUTH    */
+    "你耗尽了",        /* 6 STARVED  */
+    "困层"             /* 7 STRANDED */
+};
+const char *const *echo_end_titles(void) { return END_TITLES; }
+
 /* 六张碎片：同一件事的六个侧面，沿「第三声」这条暗线推进。
  * 按「第几片」(0..5) 取文案：碎片层每局随机，但叙事顺序必须固定——
  * 玩家总是先捡到第一片（风/井/第三声），最后捡到第六片（照片里的人是你）。 */
-static const char *fragment_text(int idx) {
+const char *echo_fragment_text(int idx) {
     static const char *T[6] = {
         "一张住户留言，字迹工整：「最近井道里总有回声，物业说是风。可风不会数数：第一声是风，第二声是井，第三声会比你晚一点回来。别让第三声听见你的名字。」",
         "一张寻人启事，边角被撕过：「她最后出现在一层电梯。监控拍到她对着门喊了三声。门开了，她笑了，像听见有人在叫她的名字。电梯没停过。」",
@@ -130,8 +157,9 @@ static bool is_frag_depth(const EchoState *st, int depth) {
 
 static bool floor_flag(const Floor *f, int bit) { return (f->flags & bit) != 0; }
 static void floor_set(Floor *f, int bit, bool v) {
-    if (v) f->flags = (uint8_t)(f->flags | bit);
-    else   f->flags = (uint8_t)(f->flags & ~bit);
+    /* 注意：flags 是 uint16_t（bit8 claimed），不要截断成 uint8_t */
+    if (v) f->flags = (uint16_t)(f->flags | bit);
+    else   f->flags = (uint16_t)(f->flags & ~bit);
 }
 
 static Floor *floor_at(EchoState *st, int depth) {
@@ -339,6 +367,8 @@ void echo_new_game(EchoState *st, int32_t seed, const LastRun *last) {
     st->panel_sel = 0;
     st->pending_unknown = false;
     st->ended = -1;
+    st->egg = NULL;
+    st->egg_floor = -1;
 
     st->echo_t = 0.0;
     st->echo_sig = -1;
@@ -702,9 +732,19 @@ static int open_door(EchoState *st) {
         st->phase = PHASE_OVER;
         st->flash = 1.0;
         st->egg = echo_egg_at(st->depth);
+        st->egg_floor = st->depth;      /* 档案按楼层分别记录每个彩蛋 */
         set_msg(st, st->egg->text);
         got = 1;
         emit(st, EV_EGG);
+    } else if (floor_flag(f, FLOOR_F_CLAIMED)) {
+        /* 这一层的东西已经被取过一次了：再开只有风 */
+        static const char *again_msgs[] = {
+            "你已经把这层翻遍了。剩下的只有风。",
+            "门又开了。这层已经被你掏空了，什么都没剩下。",
+            "你再次推开这扇门。该拿的早拿走了，剩下的只有黑暗。"
+        };
+        set_msg(st, again_msgs[(int)(rand01(st) * 3) % 3]);
+        emit(st, EV_EMPTY);
     } else if (floor_flag(f, FLOOR_F_TOOL)) {
         /* 递减：45 → 32.4 → 23.3 → 16.8 → 12.1 → 到底 12。保底每次仍回 12% 耐久度。 */
         double raw = CFG_REPAIR_BASE * pow(CFG_REPAIR_DECAY, (double)st->repairs);
@@ -713,17 +753,29 @@ static int open_door(EchoState *st) {
         st->wear -= fix;
         if (st->wear < 0) st->wear = 0;
         st->repairs++;
-        static const char *rep_fmt[] = {
-            "你找到一些工具，尝试加固了电梯（第 %d 次修复，回 %d%% 耐久）",
-            "你摸到一些工具。你加固了电梯。第 %d 次，回 %d%% 耐久。",
-            "你找到一些工具。电梯又稳了一些。第 %d 次。"
+        /* 不报数字：只描述「稳了多少」的手感，让玩家自己感觉修复在变弱。
+         * 档位：big ≥30 / mid ≥18 / small <18（保底 12）。 */
+        static const char *rep_big[] = {
+            "你找到一套工具。把电梯松掉的地方都拧紧了。",
+            "你摸到工具。钢缆重新绷紧，运行声低了下去。",
+            "你找到些能用的东西。电梯稳了，像刚修好不久。"
         };
-        int ri = (int)(rand01(st) * 3) % 3;
-        snprintf(st->msg, sizeof(st->msg), rep_fmt[ri],
-                 st->repairs, (int)(fix + 0.5));
+        static const char *rep_mid[] = {
+            "你找到几件工具。你加固了能加固的地方。",
+            "你摸到一些工具。轿厢还是晃，但轻了些。",
+            "你找到工具。电梯没那么响了。"
+        };
+        static const char *rep_small[] = {
+            "你找到一点能用的材料。你把它塞进电梯缝隙里，聊胜于无。",
+            "你摸到几件工具。多数已经锈死，你只拧紧了两处。",
+            "你找到些损坏的工具。勉强加固了电梯，你知道撑不了太久。"
+        };
+        const char **pool = fix >= 30.0 ? rep_big : (fix >= 18.0 ? rep_mid : rep_small);
+        set_msg(st, pool[(int)(rand01(st) * 3) % 3]);
         if (floored) {
             strncat(st->msg, " 再修也只能这样了。", sizeof(st->msg) - strlen(st->msg) - 1);
         }
+        floor_set(f, FLOOR_F_CLAIMED, true);
         got = 1;
         emit(st, EV_REPAIR);
     } else if (floor_flag(f, FLOOR_F_UNKNOWN_FOOD)) {
@@ -734,13 +786,15 @@ static int open_door(EchoState *st) {
         };
         set_msg(st, food_msgs[(int)(rand01(st) * 3) % 3]);
         st->pending_unknown = true;
+        floor_set(f, FLOOR_F_CLAIMED, true);
         got = 1;
         emit(st, EV_UNKNOWN_FOOD);
     } else if (floor_flag(f, FLOOR_F_FRAGMENT) && !floor_flag(f, FLOOR_F_FRAGMENT_TAKEN)) {
         st->fragments++;
         floor_set(f, FLOOR_F_FRAGMENT_TAKEN, true);
+        floor_set(f, FLOOR_F_CLAIMED, true);
         int idx = fragment_index_at(st, st->depth);
-        const char *txt = fragment_text(idx);
+        const char *txt = echo_fragment_text(idx);
         if (st->fragments >= FRAGMENT_DEPTH_COUNT) {
             snprintf(st->msg, sizeof(st->msg), "%s 六张碎片拼齐了。该去凑最后一道顺了。", txt);
         } else {
@@ -757,11 +811,12 @@ static int open_door(EchoState *st) {
             "角落里有一件旧东西。你想起自己是谁。手不再抖了。"
         };
         set_msg(st, hope_msgs[(int)(rand01(st) * 3) % 3]);
+        floor_set(f, FLOOR_F_CLAIMED, true);
         got = 1;
         emit(st, EV_HOPE);
     } else if (floor_flag(f, FLOOR_F_LOOT)) {
         double before = st->food;
-        st->food += 40.0;
+        st->food += CFG_FOOD_LOOT;
         if (st->food > CFG_FOOD_CAP) st->food = CFG_FOOD_CAP;
         static const char *loot_msgs[] = {
             "你摸到几包还没过期的东西",
@@ -769,8 +824,9 @@ static int open_door(EchoState *st) {
             "角落里有一份东西。是食物。"
         };
         const char *lm = loot_msgs[(int)(rand01(st) * 3) % 3];
-        if (st->food - before < 40.0) lm = "你找到一些吃的。你只拿得动这些了。";
+        if (st->food - before < CFG_FOOD_LOOT) lm = "你找到一些吃的。你只拿得动这些了。";
         set_msg(st, lm);
+        floor_set(f, FLOOR_F_CLAIMED, true);
         got = 1;
         emit(st, EV_LOOT);
     } else {
@@ -782,6 +838,17 @@ static int open_door(EchoState *st) {
         };
         set_msg(st, empty_msgs[(int)(rand01(st) * 4) % 4]);
         emit(st, EV_EMPTY);
+    }
+
+    /* 停摆后开门 = 最后一张牌。这一层若没有能修它的东西，就再没有下一层了：
+     * 井道是这栋楼唯一的通道（没有楼梯），电梯不动 = 永远停在这一层。
+     * 与 END_STALLED 互斥：STALLED 在 end_check 里（停摆 + 食物耗尽 + 没开门），
+     * STRANDED 在这里（停摆 + 开了门 + 这层没工具）。 */
+    if (st->ended == -1 && echo_is_stalled(st)) {
+        st->ended = END_STRANDED;
+        st->phase = PHASE_OVER;
+        set_msg(st, "门外没有能修的东西。你走遍了这一层——没有楼梯，也没有向上的路。");
+        emit(st, EV_STRANDED);
     }
 
     st->door_result.type = ft;
@@ -903,7 +970,31 @@ void echo_tick(EchoState *st, double dt_ms) {
 /* ==========================================================================
  * 结局文案 / 结算
  * ========================================================================== */
+/* 困层：停摆后开门，这一层没有能修电梯的东西，而井道之外没有别的路。
+ * 含当前楼层数字，故写入静态缓冲（调用方即用，不可跨次持有）。 */
+const char *echo_stranded_text(const EchoState *st) {
+    static char buf[128];
+    int d = st->depth < 0 ? -st->depth : st->depth;
+    snprintf(buf, sizeof(buf),"门开了，外面只有黑暗。你回到轿厢，门合上。数字还亮着：B%d。但它不会再变了。", d);
+    return buf;
+}
+
+/* 历史档案版：按结局编号取正文。困层不写楼层（档案跨局，具体楼层没意义）。 */
+const char *echo_end_text_by_id(int end_id) {
+    switch (end_id) {
+        case END_TRUTH:   return truth_text();
+        case END_BECAME:  return "你不再确定门外有没有东西。于是你呼喊了一声，等一个回应。";
+        case END_MADNESS: return "你开始对着门说话。门外的声音也在说话，节奏和你一样。";
+        case END_TAKEN:   return "门开了。你的回声从外面传回来，比你的手早了半秒。";
+        case END_STARVED: return "你没有输给它，只是先一步耗尽了。电梯停在原地，门外的回声还在等你回应，可你已经没有力气再呼喊。";
+        case END_STALLED: return "电梯停了。你还有力气开门，但已经没有力气走出去了。";
+        case END_STRANDED: return "门开了，外面只有黑暗。你回到轿厢，门合上。数字还亮着。但它不会再变了。";
+        default:          return "";
+    }
+}
+
 const char *echo_end_text(const EchoState *st) {
+    if (st->ended == END_STRANDED) return echo_stranded_text(st);
     if (st->ended == END_TRUTH)   return truth_text();
     if (st->ended == END_EGG)     return st->egg ? st->egg->text : "";
     if (st->ended == END_BECAME)  return "你不再确定门外有没有东西。于是你呼喊了一声，等一个回应。";

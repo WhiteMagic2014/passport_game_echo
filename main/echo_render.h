@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include "echo_core.h"
+#include "echo_history.h"
 
 #define ECHO_W 240
 #define ECHO_H 320
@@ -38,10 +39,10 @@
 #define C_RIVET   RGB565(0x4d, 0x5c, 0x6d)   /* #4d5c6d 铆钉 */
 
 /* ==========================================================================
- * 主菜单（开始 / 继续 / 音量 / 说明）
+ * 主菜单（开始 / 继续 / 音量 / 历史）——与 HTML 版四项对齐
  * ========================================================================== */
 typedef enum {
-    MENU_MAIN = 0, MENU_VOLUME, MENU_HELP
+    MENU_MAIN = 0, MENU_VOLUME, MENU_HELP, MENU_HISTORY
 } menu_screen_t;
 
 typedef struct {
@@ -50,6 +51,8 @@ typedef struct {
     uint8_t volume;    /* 0..100 */
     bool has_continue; /* 是否存在可续的存档 */
     int last_depth;    /* 上一局最深深度，<=0 表示无记录 */
+    EchoArchive archive;  /* 历史档案（进入「历史」时从 NVS 载入） */
+    HistView  hist;       /* 历史浏览视图 */
 } MenuState;
 
 /* ==========================================================================

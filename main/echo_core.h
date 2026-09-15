@@ -25,9 +25,10 @@ extern "C" {
  * ========================================================================== */
 #define CFG_WEAR_MAX          100.0
 #define CFG_SANITY_MAX        100.0
-#define CFG_FOOD_MAX          60.0    /* 携带上限（背包容量，不可无限囤积） */
-#define CFG_FOOD_START        40.0    /* 初始携带 */
-#define CFG_FOOD_CAP          60.0    /* 拾取食物的上限（与 FOOD_MAX 同义） */
+#define CFG_FOOD_MAX          40.0    /* 携带上限（背包容量，不可无限囤积） */
+#define CFG_FOOD_START        28.0    /* 初始携带（约 18 次移动的余量，逼你早开门） */
+#define CFG_FOOD_CAP          40.0    /* 拾取食物的上限（与 FOOD_MAX 同义） */
+#define CFG_FOOD_LOOT         26.0    /* 一次搜刮的补给量（低于上限，囤不满） */
 #define CFG_DANGER_MAX        100.0   /* 危险读数上限（由怪物距离推导，不再手动累加） */
 
 #define CFG_WEAR_DOWN         2.3
@@ -129,8 +130,10 @@ typedef enum {
 } phase_t;
 
 typedef enum {
-    END_STALLED = 0, END_MADNESS, END_TAKEN, END_BECAME, END_EGG, END_TRUTH, END_STARVED
+    END_STALLED = 0, END_MADNESS, END_TAKEN, END_BECAME, END_EGG, END_TRUTH, END_STARVED,
+    END_STRANDED      /* 困层：停摆后开门，这一层没有能修它的东西 */
 } end_t;
+#define END_COUNT 8
 
 /* 事件（对应 JS emit 的字符串）。带音效的由音频层消费，其余保留供调试/扩展。 */
 typedef enum {
@@ -139,7 +142,7 @@ typedef enum {
     EV_ENCOUNTER, EV_BREATH, EV_LISTEN, EV_SILENT_ECHO, EV_AMBIENCE_CUT,
     EV_AHEAD, EV_DOOR, EV_EGG, EV_TRUTH, EV_REPAIR,
     EV_MEMORY_LIE, EV_HOPE, EV_LOOT, EV_FRAGMENT, EV_UNKNOWN_FOOD, EV_ATE,
-    EV_EMPTY
+    EV_EMPTY, EV_STRANDED
 } event_t;
 
 /* 按键：0=上 1=下 2=确认（与 BSP_BTN_UP/DOWN/OK 对齐） */
@@ -158,8 +161,7 @@ typedef enum {
 /* 楼层：惰性生成后缓存。flags 用位标志省内存（ESP32-C3 无 PSRAM）。 */
 typedef struct {
     uint8_t type;    /* floor_type_t */
-    uint8_t flags;   /* bit0 hope, bit1 loot, bit2 tool, bit3 unknown_food,
-                        bit4 fragment, bit5 seen, bit6 generated, bit7 fragment_taken */
+    uint16_t flags;  /* 见下方 FLOOR_F_*（bit8 claimed 需要 16 位） */
 } Floor;
 
 enum {
@@ -170,7 +172,8 @@ enum {
     FLOOR_F_FRAGMENT = 1 << 4,
     FLOOR_F_SEEN = 1 << 5,
     FLOOR_F_GENERATED = 1 << 6,
-    FLOOR_F_FRAGMENT_TAKEN = 1 << 7   /* 碎片是否已被取走（用于聆听线索消失） */
+    FLOOR_F_FRAGMENT_TAKEN = 1 << 7,  /* 碎片是否已被取走（用于聆听线索消失） */
+    FLOOR_F_CLAIMED = 1 << 8          /* 本层奖励已被取过一次（再开只有风） */
 };
 
 /* 彩蛋结局（静态表，按 depth 查询） */
@@ -224,6 +227,7 @@ typedef struct {
     int panel_sel;
     int ended;           /* end_t，-1 表示未结束 */
     const EggDef *egg;   /* 触发的彩蛋（END_EGG 时指向静态 EggDef） */
+    int egg_floor;       /* 触发彩蛋时的楼层（历史档案按楼层分别记录） */
 
     /* 回声演出 */
     double echo_t;
@@ -300,14 +304,29 @@ bool echo_monster_here(const EchoState *st);
 /* 彩蛋查询：返回指向静态 EggDef 的指针，无则 NULL。 */
 const EggDef *echo_egg_at(int depth);
 
+/* 彩蛋表（历史档案用）：按楼层升序，索引 0..EGG_COUNT-1。越界返回 NULL。 */
+#define EGG_COUNT 6
+const EggDef *echo_egg_by_index(int i);
+/* 彩蛋楼层 → 索引，非彩蛋楼层返回 -1。 */
+int echo_egg_index_of(int depth);
+/* 结局标题表（按 end_t 下标，END_COUNT 条），供历史档案列出未解锁条目名。 */
+const char *const *echo_end_titles(void);
+/* 第 idx 片碎片的正文（0..FRAGMENT_DEPTH_COUNT-1），历史档案详情用。 */
+const char *echo_fragment_text(int idx);
+/* 困层结局正文（含当前楼层，写入内部静态缓冲，返回后即用） */
+const char *echo_stranded_text(const EchoState *st);
+/* 按结局编号取正文（END_COUNT 条，历史档案用；END_EGG 返回 ""，
+ * 困层为不含楼层的通用版——档案跨局，具体楼层没有意义）。 */
+const char *echo_end_text_by_id(int end_id);
+
 /* ==========================================================================
  * 续局存档：全量序列化 EchoState（处理 egg 指针）。
  * 仅用于「继续上一局」，与 LastRun（跨局足迹）是两套不同的存档。
  * ========================================================================== */
 #define ECHO_SAVE_MAGIC    0x4543484Fu   /* "ECHO" */
-/* v3：怪物模型重构（fear_pos/fear_mode → monsters[] + 信标），新增 fragment_depths /
- *     door_truth / mark 字段，Floor 新增 fragment_taken 位。v2 及以下存档一律拒绝。 */
-#define ECHO_SAVE_VERSION  3
+/* v4：Floor.flags 扩到 16 位（新增 claimed 位）、新增 END_STRANDED / egg_floor、
+ *     食物数值改为 START 28 / CAP 40 / LOOT 26。v3 及以下存档一律拒绝。 */
+#define ECHO_SAVE_VERSION  4
 
 typedef struct {
     uint32_t magic;

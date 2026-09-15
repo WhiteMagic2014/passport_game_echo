@@ -4,6 +4,7 @@
 idf_component_register(
     SRCS "echo_core.c"
          "echo_render.c"
+         "echo_history.c"
          "echo_main.c"
     INCLUDE_DIRS "."
     REQUIRES bsp esp_lcd esp_timer freertos nvs_flash
